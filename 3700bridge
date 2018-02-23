@@ -1,0 +1,253 @@
+#!/usr/bin/python3 -u
+# The -u makes output unbuffered, so it will show up immediately
+import datetime
+import sys
+import socket
+import select
+import json
+import time
+
+
+def pad(name):
+    """pads the name with null bytes at the end"""
+    result = '\0' + name
+    while len(result) < 108:
+        result += '\0'
+    return result
+
+
+class Bridge(object):
+    def __init__(self, id, LAN):
+        print("Bridge " + id + " starting up")
+
+        self.id = id
+        self.LAN = LAN
+
+        # creates sockets and connects to them
+        self.sockets = []
+        for x in range(len(LAN)):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            s.connect(pad(LAN[x]))
+            self.sockets.append(s)
+        self.socket_status = ["active" for s in self.sockets]
+
+        self.root = id
+        self.cost = 0
+        self.root_port = None
+        self.root_port_neighbor_id = None
+        self.root_port_neighbor_exists = False
+
+        self.message_id = 0
+        self.spanning_tree_complete = False
+        self.last_bpdu_sent_at = None
+
+        self.forwarding_table = {}          # host: (port, last_received)
+        self.bridge_table = {}              # bridge: last_received
+        self.message_buffer = []            # (msg, recv_socket_index)
+
+    def go(self):
+        """Main loop for this bridge. Read from sockets, handle BPDUs, and forward data packets."""
+
+        while True:
+            active_sockets = self.get_active_sockets()
+
+            if self.spanning_tree_complete:
+                # Detect bridge failures
+                for k, v in self.bridge_table.items():
+                    time_since = (datetime.datetime.now() - v).total_seconds()
+                    if time_since >= .75:
+                        print("Bridge {id} last heard from {s}s ago. Failed. Recalculating spanning tree.".format(id=k, s=time_since))
+                        self.reset()
+
+                # Time out old forwarding table entries
+                for k, v in self.forwarding_table.items():
+                    time_since = (datetime.datetime.now() - v[1]).total_seconds()
+                    if time_since > 5:
+                        self.forwarding_table.pop(k, None)
+                        break
+
+            if self.message_id >= 8:
+                self.spanning_tree_complete = True
+
+            # Send out BPDUs
+            if self.message_id < 8 or (datetime.datetime.now() - self.last_bpdu_sent_at).total_seconds() >= 0.3:
+                ignore, ready, ignore2 = select.select([], self.sockets, [], 1)
+
+                bpdu_msg = {
+                    "source": 0,
+                    "root_port_neighbor": self.root_port_neighbor_id,
+                    "dest": "ffff",
+                    "type":"bpdu",
+                    "message": {
+                        "id": self.id,
+                        "root": self.root,
+                        "cost": self.cost
+                    }
+                }
+
+                for x in ready:
+                    bpdu_msg["source"] = self.sockets.index(x)
+                    data = x.send(json.dumps(bpdu_msg).encode())
+                    self.message_id = self.message_id + 1
+
+                self.spanning_tree_complete = True
+                self.last_bpdu_sent_at = datetime.datetime.now()
+
+            if self.spanning_tree_complete and self.message_buffer:
+                self.send_buffered_messages()
+
+            # Get sockets that are ready to be read from
+            ready, ignore, ignore2 = select.select(self.sockets, [], [], .75)
+
+            # Reads from each of the ready sockets
+            for x in ready:
+                data = x.recv(1500)
+                recv_socket_index = self.sockets.index(x)            # index of the socket that is reading the incoming message
+                msg_recv = json.loads(data.decode())            # the received JSON messgage (BPDU or Data)
+
+                # Receive BPDUs always
+                if msg_recv.get('type') == 'bpdu':
+                    self.handle_bpdu(msg_recv, recv_socket_index)
+
+                # Receive data packets if on an active socket, otherwise drop on floor
+                elif x in self.get_active_sockets() and msg_recv.get('type') == 'data':
+                    recv_msg_id = msg_recv.get('message').get('id')
+
+                    print("Received message {mid} on port {port_id} from {source} to {dest}".format(mid=recv_msg_id,
+                            port_id=recv_socket_index, source=msg_recv.get('source'), dest=msg_recv.get('dest')))
+
+                    # Update forwarding table with this host's location and when we heard from it
+                    self.forwarding_table[msg_recv.get('source')] = (self.sockets.index(x), datetime.datetime.now())
+
+                    if not self.spanning_tree_complete:
+                        print("Spanning tree not complete. Message {mid} in buffer.".format(mid=recv_msg_id))
+                        self.message_buffer.append((msg_recv, recv_socket_index))
+                    else:
+                        self.send_message(msg_recv, recv_socket_index)
+
+    def reset(self):
+        """Reset variables so we can re-calculate the spanning tree"""
+
+        self.spanning_tree_complete = False
+        self.message_id = 0
+        self.bridge_table = {}
+        self.forwarding_table = {}
+        self.socket_status = ["active" for s in self.sockets]
+        self.root_port_neighbor_id = None
+        self.root_port_neighbor_exists = False
+
+    def handle_bpdu(self, msg_recv, recv_socket_index):
+        """Handle incoming BPDUs and calculate spanning tree"""
+
+        their_source_port = msg_recv.get('source')                      # source port of message sender
+        their_root = msg_recv.get('message').get('root')                # root of message sender
+        their_cost = msg_recv.get('message').get('cost')                # cost to root of message sender
+        their_sending_bridge_id = msg_recv.get('message').get('id')     # id of message sender
+        their_root_port_neighbor = msg_recv.get('root_port_neighbor')   # message sender's direct neighbor at root
+
+        # Detect if a new bridge has shown up; otherwise, remember when we last heard from this bridge
+        if self.spanning_tree_complete and (not self.bridge_table.get(their_sending_bridge_id) or their_root != self.root) and their_root < self.root:
+            print("New bridge {id}. Recalculating spanning tree.".format(id=their_sending_bridge_id))
+            self.reset()
+        else:
+            self.bridge_table[their_sending_bridge_id] = datetime.datetime.now()
+
+        # We just received a BPDU from ourselves; determine which port is designated for this LAN
+        if msg_recv.get('message').get('id') == id:
+            if recv_socket_index <= their_source_port:                  # keep RECEIVING port open, close SENDING
+                if self.socket_status[their_source_port] == 'active':
+                    print("Disabled port: {id}/{port_id}".format(id=self.id, port_id=their_source_port))
+                self.socket_status[their_source_port] = 'inactive'
+            else:                                                       # keep SENDING porto pen, close RECEIVING
+                if self.socket_status[recv_socket_index] == 'active':
+                    print("Disabled port: {id}/{port_id}".format(id=id, port_id=recv_socket_index))
+                self.socket_status[recv_socket_index] = 'inactive'
+
+        # We just received a BPDU from another bridge
+        else:
+            if their_root == self.root and their_cost < self.cost and recv_socket_index != self.root_port:
+                self.socket_status[recv_socket_index] = 'inactive'
+            elif their_root == self.root and their_cost == self.cost and recv_socket_index != self.root_port and int(their_sending_bridge_id, 16) < int(id, 16):
+                self.socket_status[recv_socket_index] = 'inactive'
+
+        # Calculate spanning tree
+        # Their root is better
+        if int(their_root, 16) < int(self.root, 16):
+            self.root = their_root
+            self.root_port = recv_socket_index
+            self.socket_status[self.root_port] = 'active'
+            self.socket_status = ["active" for s in self.sockets]
+            self.root_port_neighbor_id = their_sending_bridge_id
+            self.cost = their_cost + 1
+            self.root_port_neighbor_exists = True
+            print("New root: {this_id}/{root}".format(this_id=self.id, root=self.root))
+            print("Root port: {this_id}/{port_id}".format(this_id=self.id, port_id=self.root_port))
+
+        # Our roots are the same, but they have a shorter path
+        elif their_root == self.root and their_cost + 1 < self.cost:
+            self.root_port = recv_socket_index
+            self.socket_status[self.root_port] = 'active'
+            self.socket_status = ["active" for s in self.sockets]
+            self.cost = their_cost + 1
+            self.root_port_neighbor_id = their_sending_bridge_id
+            self.root_port_neighbor_exists = True
+            print("Root port: {this_id}/{port_id}".format(this_id=self.id, port_id=self.root_port))
+
+        # Decide between two neighbors with the same cost path to the root
+        elif their_root == self.root and their_cost + 1 == self.cost and self.root_port_neighbor_exists and \
+            int(their_sending_bridge_id, 16) < int(self.root_port_neighbor_id, 16):
+            self.root_port = recv_socket_index
+            self.socket_status[self.root_port] = 'active'
+            self.socket_status = ["active" for s in self.sockets]
+            self.root_port_neighbor_id = their_sending_bridge_id
+            print("Root port: {this_id}/{port_id}".format(this_id=self.id, port_id=self.root_port))
+
+    def get_active_sockets(self):
+        """Loop through all sockets and find the active sockets"""
+        active_sockets = []
+        for s in self.sockets:
+            socket_index = self.sockets.index(s)
+            if self.socket_status[socket_index] == 'active':
+                active_sockets.append(s)
+        return active_sockets
+
+    def send_buffered_messages(self):
+        """Send any messages we may have received while building the spanning tree"""
+
+        for msg_recv, recv_socket_index in self.message_buffer:
+            self.send_message(msg_recv, recv_socket_index)
+            self.message_buffer.remove((msg_recv, recv_socket_index))
+
+    def send_message(self, msg_recv, recv_socket_index):
+        """
+        Forward a data packet toward its destination if we know it,
+        or flood the network with it if we don't.
+        """
+
+        recv_msg_id = msg_recv.get('message').get('id')
+
+        # We know where this message should go; forward it there
+        if self.forwarding_table.get(msg_recv.get('dest')):
+            forward_port = self.forwarding_table.get(msg_recv.get('dest'))[0]
+            s = self.sockets[forward_port]
+
+            if self.socket_status[forward_port] == 'active' and forward_port == recv_socket_index:
+                print("Not forwarding message {mid}".format(mid=recv_msg_id))
+            if self.socket_status[forward_port] == 'active' and forward_port != recv_socket_index:
+                s.send(json.dumps(msg_recv).encode())
+                print("Forwarding message {mid} to port {port_id}".format(mid=recv_msg_id, port_id=self.sockets.index(s)))
+
+        # Flood on all active ports
+        else:
+            sockets_to_flood = [s for s in self.get_active_sockets() if self.sockets.index(s) != recv_socket_index]
+            for s in sockets_to_flood:
+                s.send(json.dumps(msg_recv).encode())
+                print("Broadcasting message {mid} to all ports".format(mid=recv_msg_id))
+
+
+if __name__ == "__main__":
+    id = sys.argv[1]
+    LAN = sys.argv[2:]
+
+    b = Bridge(id, LAN)
+    b.go()
